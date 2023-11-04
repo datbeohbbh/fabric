@@ -88,6 +88,8 @@ func (n *node) start(fresh, join bool) {
 	go n.run(campaign)
 }
 
+// try campaign
+// run main loop for serving incoming request
 func (n *node) run(campaign bool) {
 	electionTimeout := n.tickInterval.Seconds() * float64(n.config.ElectionTick)
 	halfElectionTimeout := electionTimeout / 2
@@ -116,7 +118,7 @@ func (n *node) run(campaign bool) {
 			for {
 				select {
 				case <-campaignTicker.C():
-					n.Campaign(context.TODO())
+					n.Campaign(context.TODO()) // embedded raft.Node interface
 				case <-elected:
 					return
 				case <-n.chain.doneC:
@@ -136,6 +138,8 @@ func (n *node) run(campaign bool) {
 			n.Tick()
 			n.tracker.Check(&status)
 
+		// internally, etcd raft handle the log and rd.Entries which are being received from n.Ready() 
+		// is commited entries.
 		case rd := <-n.Ready():
 			startStoring := n.clock.Now()
 			if err := n.storage.Store(rd.Entries, rd.HardState, rd.Snapshot); err != nil {
@@ -183,6 +187,8 @@ func (n *node) run(campaign bool) {
 	}
 }
 
+// follower role will not send anything.
+// only leader and candidate should send messages to other peers.
 func (n *node) send(msgs []raftpb.Message) {
 	n.unreachableLock.RLock()
 	defer n.unreachableLock.RUnlock()
@@ -220,6 +226,7 @@ func (n *node) send(msgs []raftpb.Message) {
 	}
 }
 
+// if all entries is EntryNormal or entries are client command => no sync
 func (n *node) maybeSyncWAL(entries []raftpb.Entry) {
 	allNormal := true
 	for _, entry := range entries {

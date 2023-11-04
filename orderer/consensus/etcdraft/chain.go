@@ -150,6 +150,8 @@ type gc struct {
 }
 
 // Chain implements consensus.Chain interface.
+// Chain is actually a state machine.
+// Chain holds a raft node.
 type Chain struct {
 	configurator Configurator
 
@@ -217,7 +219,8 @@ type Chain struct {
 	leadershipTransferInProgress uint32
 }
 
-// NewChain constructs a chain object.
+// NewChain constructs a chain object.main
+// Setting up raft node
 func NewChain(
 	support consensus.ConsenterSupport,
 	opts Options,
@@ -230,6 +233,7 @@ func NewChain(
 ) (*Chain, error) {
 	lg := opts.Logger.With("channel", support.ChannelID(), "node", opts.RaftID)
 
+	// check if a node is new node joining cluster
 	fresh := !wal.Exist(opts.WALDir)
 	storage, err := CreateStorage(lg, opts.WALDir, opts.SnapDir, opts.MemoryStorage)
 	if err != nil {
@@ -328,6 +332,7 @@ func NewChain(
 		DisableProposalForwarding: true, // This prevents blocks from being accidentally proposed by followers
 	}
 
+	// transport implementation for communicating within cluster
 	disseminator := &Disseminator{RPC: c.rpc}
 	disseminator.UpdateMetadata(nil) // initialize
 	c.ActiveNodes.Store([]uint64{})
@@ -351,6 +356,7 @@ func NewChain(
 			logger: c.logger,
 		},
 	}
+	// store the lastest state of raft node
 	c.Node.confState.Store(&cc)
 
 	return c, nil
@@ -371,6 +377,7 @@ func (c *Chain) Start() {
 		isJoin = false
 		c.logger.Infof("Consensus-type migration detected, starting new raft node on an existing channel; height=%d", c.support.Height())
 	}
+	// starting raft node
 	c.Node.start(c.fresh, isJoin)
 
 	close(c.startC)
@@ -397,6 +404,8 @@ func (c *Chain) Start() {
 }
 
 // Order submits normal type transactions for ordering.
+// submit request to a node and re-route to current leader if node is not a leader.
+// leader should process request and propose to internal raft.
 func (c *Chain) Order(env *common.Envelope, configSeq uint64) error {
 	c.Metrics.NormalProposalsReceived.Add(1)
 	return c.Submit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0)
@@ -518,6 +527,8 @@ func (c *Chain) Consensus(req *orderer.ConsensusRequest, sender uint64) error {
 		return nil
 	}
 
+	// received message from network.
+	// c.Node.Step(...) pass message into internal etcd raft.
 	if err := c.Node.Step(context.TODO(), *stepMsg); err != nil {
 		return fmt.Errorf("failed to process Raft Step message: %s", err)
 	}
@@ -675,6 +686,7 @@ func (c *Chain) run() {
 				select {
 				case b := <-ch:
 					data := protoutil.MarshalOrPanic(b)
+					// only leader can propose a block and make consensus on the order of blocks
 					if err := c.Node.Propose(ctx, data); err != nil {
 						c.logger.Errorf("Failed to propose block [%d] to raft and discard %d blocks in queue: %s", b.Header.Number, len(ch), err)
 						return
@@ -703,7 +715,7 @@ func (c *Chain) run() {
 
 	for {
 		select {
-		case s := <-submitC:
+		case s := <-submitC: // re-route request
 			if s == nil {
 				// polled by `WaitReady`
 				continue
@@ -913,11 +925,12 @@ func (c *Chain) writeBlock(block *common.Block, index uint64) {
 // Orders the envelope in the `msg` content. SubmitRequest.
 // Returns
 //
-//	-- batches [][]*common.Envelope; the batches cut,
+//	-- batches [][]*common.Envelope; the batches cut, // batches[i] is a block which contains one or more Envelop
 //	-- pending bool; if there are envelopes pending to be ordered,
 //	-- err error; the error encountered, if any.
 //
 // It takes care of config messages as well as the revalidation of messages if the config sequence has advanced.
+// This method must only be called by leader.
 func (c *Chain) ordered(msg *orderer.SubmitRequest) (batches [][]*common.Envelope, pending bool, err error) {
 	seq := c.support.Sequence()
 
@@ -1022,6 +1035,8 @@ func (c *Chain) ordered(msg *orderer.SubmitRequest) (batches [][]*common.Envelop
 	return batches, pending, nil
 }
 
+// After create a batch of blocks (block contains one or more envelops)
+// propose block for consensus on order of blocks.
 func (c *Chain) propose(ch chan<- *common.Block, bc *blockCreator, batches ...[]*common.Envelope) {
 	for _, batch := range batches {
 		b := bc.createNextBlock(batch)
@@ -1141,6 +1156,7 @@ func (c *Chain) detectConfChange(block *common.Block) *MembershipChanges {
 	return changes
 }
 
+// received all commited block from consensus
 func (c *Chain) apply(ents []raftpb.Entry) {
 	if len(ents) == 0 {
 		return
